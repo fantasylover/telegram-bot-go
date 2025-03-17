@@ -240,7 +240,7 @@ func checkUserJoinedChannels(bot *tgbotapi.BotAPI, userID int64, db *sql.DB) (bo
     for _, channel := range channels {
         chatConfig := tgbotapi.GetChatMemberConfig{
             ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
-                ChatID: channel,
+                ChatID: channel, // String hi use karenge
                 UserID: userID,
             },
         }
