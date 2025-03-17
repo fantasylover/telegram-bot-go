@@ -1,6 +1,6 @@
 package main
 
-imptutunort (
+import (
     "bytes"
     "database/sql"
     "fmt"
