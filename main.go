@@ -1,12 +1,10 @@
 package main
 
-
 import (
     "bytes"
     "database/sql"
     "fmt"
     "log"
-    "math/rand"
     "strconv"
     "strings"
     "time"
@@ -14,893 +12,539 @@ import (
     _ "github.com/mattn/go-sqlite3"
     tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
     "github.com/skip2/go-qrcode"
-    "os" // Yeh add karo
+    "os"
 )
 
-// Constants
 const (
-	BOT_TOKEN = "1743577119:AAEiYy_kgUK41RcBxF18NgkR4VehXtZWm_w" // BotFather token
-	ADMIN_ID  = 1192041312                                  // Admin Telegram ID
+    BOT_TOKEN = "1743577119:AAEiYy_kgUK41RcBxF18NgkR4VehXtZWm_w"
+    ADMIN_ID  = 1192041312
 )
 
 var BOT_USERNAME string
 
-// Initialize database
-func initDB() *sql.DB {
-	db, err := sql.Open("sqlite3", "./bot.db")
-	if err != nil {
-		log.Fatal(err)
-	}
+func initDB() (*sql.DB, error) {
+    db, err := sql.Open("sqlite3", "bot.db")
+    if err != nil {
+        return nil, err
+    }
 
-	// Create tables
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS users (
-		id INTEGER PRIMARY KEY,
-		username TEXT,
-		balance REAL DEFAULT 0,
-		wallet TEXT,
-		referrals INTEGER DEFAULT 0,
-		referred_by INTEGER DEFAULT 0,
-		banned INTEGER DEFAULT 0,
-		button_style TEXT DEFAULT 'inline',
-		state TEXT DEFAULT ''
-	)`)
-	if err != nil {
-		log.Fatal(err)
-	}
+    // Create users table
+    _, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            balance REAL DEFAULT 0,
+            referrer_id INTEGER,
+            state TEXT,
+            withdrawal_address TEXT
+        )
+    `)
+    if err != nil {
+        return nil, err
+    }
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS settings (
-		key TEXT PRIMARY KEY,
-		value TEXT
-	)`)
-	if err != nil {
-		log.Fatal(err)
-	}
+    // Create settings table
+    _, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    `)
+    if err != nil {
+        return nil, err
+    }
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS required_channels (
-		channel_id TEXT PRIMARY KEY
-	)`)
-	if err != nil {
-		log.Fatal(err)
-	}
+    // Create withdrawals table
+    _, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            address TEXT,
+            status TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    `)
+    if err != nil {
+        return nil, err
+    }
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS withdrawals (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		user_id INTEGER,
-		amount REAL,
-		wallet TEXT,
-		status TEXT DEFAULT 'pending',
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-	)`)
-	if err != nil {
-		log.Fatal(err)
-	}
+    // Insert default settings if not exists
+    _, err = db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_reward', '0.5')")
+    if err != nil {
+        return nil, err
+    }
+    _, err = db.Exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '7.0')")
+    if err != nil {
+        return nil, err
+    }
 
-	// Default settings
-	setSetting(db, "min_withdrawal", "10")
-	setSetting(db, "referral_reward", "5")
-	setSetting(db, "start_message", "Welcome to the bot! Use /start to begin.")
-	setSetting(db, "payment_channel", "@YourPaymentChannel")
-	setSetting(db, "qr_enabled", "1")
-
-	return db
+    return db, nil
 }
 
-// User struct for database
 type User struct {
-	ID          int64
-	Username    string
-	Balance     float64
-	Wallet      string
-	Referrals   int
-	ReferredBy  int64
-	Banned      bool
-	ButtonStyle string
-	State       string
+    ID                int64
+    Username          string
+    Balance           float64
+    ReferrerID        sql.NullInt64
+    State             string
+    WithdrawalAddress string
 }
 
-// Setting struct for database
 type Setting struct {
-	Key   string
-	Value string
+    Key   string
+    Value string
 }
 
-// Withdrawal struct for database
 type Withdrawal struct {
-	ID        int
-	UserID    int64
-	Amount    float64
-	Wallet    string
-	Status    string
-	Timestamp time.Time
+    ID        int64
+    UserID    int64
+    Amount    float64
+    Address   string
+    Status    string
+    CreatedAt time.Time
 }
 
-// Database helper functions
+
 func getUser(db *sql.DB, userID int64) (User, error) {
-	var user User
-	err := db.QueryRow("SELECT id, username, balance, wallet, referrals, referred_by, banned, button_style, state FROM users WHERE id = ?", userID).Scan(
-		&user.ID, &user.Username, &user.Balance, &user.Wallet, &user.Referrals, &user.ReferredBy, &user.Banned, &user.ButtonStyle, &user.State)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			user = User{ID: userID, Balance: 0, Referrals: 0, Banned: false, ButtonStyle: "inline", State: ""}
-			updateUser(db, user)
-		} else {
-			return user, err
-		}
-	}
-	return user, nil
+    var user User
+    err := db.QueryRow("SELECT id, username, balance, referrer_id, state, withdrawal_address FROM users WHERE id = ?", userID).Scan(
+        &user.ID, &user.Username, &user.Balance, &user.ReferrerID, &user.State, &user.WithdrawalAddress,
+    )
+    if err == sql.ErrNoRows {
+        return user, nil
+    }
+    return user, err
 }
 
 func getUserByUsername(db *sql.DB, username string) (User, error) {
-	var user User
-	err := db.QueryRow("SELECT id, username, balance, wallet, referrals, referred_by, banned, button_style, state FROM users WHERE username = ?", username).Scan(
-		&user.ID, &user.Username, &user.Balance, &user.Wallet, &user.Referrals, &user.ReferredBy, &user.Banned, &user.ButtonStyle, &user.State)
-	return user, err
+    var user User
+    err := db.QueryRow("SELECT id, username, balance, referrer_id, state, withdrawal_address FROM users WHERE username = ?", username).Scan(
+        &user.ID, &user.Username, &user.Balance, &user.ReferrerID, &user.State, &user.WithdrawalAddress,
+    )
+    if err == sql.ErrNoRows {
+        return user, nil
+    }
+    return user, err
 }
 
 func updateUser(db *sql.DB, user User) error {
-	_, err := db.Exec("INSERT OR REPLACE INTO users (id, username, balance, wallet, referrals, referred_by, banned, button_style, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		user.ID, user.Username, user.Balance, user.Wallet, user.Referrals, user.ReferredBy, user.Banned, user.ButtonStyle, user.State)
-	return err
-}
-
-func setSetting(db *sql.DB, key, value string) error {
-	_, err := db.Exec("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", key, value)
-	return err
+    _, err := db.Exec(
+        "INSERT OR REPLACE INTO users (id, username, balance, referrer_id, state, withdrawal_address) VALUES (?, ?, ?, ?, ?, ?)",
+        user.ID, user.Username, user.Balance, user.ReferrerID, user.State, user.WithdrawalAddress,
+    )
+    return err
 }
 
 func getSetting(db *sql.DB, key string) (string, error) {
-	var value string
-	err := db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
-	if err != nil {
-		return "", err
-	}
-	return value, nil
+    var value string
+    err := db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
+    if err == sql.ErrNoRows {
+        return "", fmt.Errorf("setting %s not found", key)
+    }
+    return value, err
 }
 
-func addRequiredChannel(db *sql.DB, channel string) error {
-	_, err := db.Exec("INSERT OR IGNORE INTO required_channels (channel_id) VALUES (?)", channel)
-	return err
+func updateSetting(db *sql.DB, key, value string) error {
+    _, err := db.Exec("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", key, value)
+    return err
 }
 
-func removeRequiredChannel(db *sql.DB, channel string) error {
-	_, err := db.Exec("DELETE FROM required_channels WHERE channel_id = ?", channel)
-	return err
+func createWithdrawal(db *sql.DB, userID int64, amount float64, address string) error {
+    _, err := db.Exec(
+        "INSERT INTO withdrawals (user_id, amount, address, status) VALUES (?, ?, ?, ?)",
+        userID, amount, address, "pending",
+    )
+    return err
 }
 
-func createWithdrawal(db *sql.DB, userID int64, amount float64, wallet string) error {
-	_, err := db.Exec("INSERT INTO withdrawals (user_id, amount, wallet) VALUES (?, ?, ?)", userID, amount, wallet)
-	return err
+func getPendingWithdrawals(db *sql.DB) ([]Withdrawal, error) {
+    rows, err := db.Query("SELECT id, user_id, amount, address, status, created_at FROM withdrawals WHERE status = 'pending'")
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var withdrawals []Withdrawal
+    for rows.Next() {
+        var w Withdrawal
+        if err := rows.Scan(&w.ID, &w.UserID, &w.Amount, &w.Address, &w.Status, &w.CreatedAt); err != nil {
+            return nil, err
+        }
+        withdrawals = append(withdrawals, w)
+    }
+    return withdrawals, nil
 }
 
-func getTotalUsers(db *sql.DB) (int, error) {
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
-	return count, err
+func updateWithdrawalStatus(db *sql.DB, withdrawalID int64, status string) error {
+    _, err := db.Exec("UPDATE withdrawals SET status = ? WHERE id = ?", status, withdrawalID)
+    return err
 }
-
-func getCompletedWithdrawals(db *sql.DB) (int, error) {
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM withdrawals WHERE status = 'completed'").Scan(&count)
-	return count, err
-}
-
-// Utility functions
-func escapeMarkdownV2(text string) string {
-	chars := []string{"_", "*", "`", "[", "]", "(", ")", ".", "!", "-", "+"}
-	for _, c := range chars {
-		text = strings.ReplaceAll(text, c, "\\"+c)
-	}
-	return text
-}
-
-func createQRCode(data string) ([]byte, error) {
-	var buf bytes.Buffer
-	err := qrcode.WriteFile(data, qrcode.Medium, 256, "qrcode.png")
-	if err != nil {
-		return nil, err
-	}
-	file, err := os.ReadFile("qrcode.png")
-	if err != nil {
-		return nil, err
-	}
-	return file, nil
-}
-
 
 func main() {
-	// Initialize bot
-	bot, err := tgbotapi.NewBotAPI(BOT_TOKEN)
-	if err != nil {
-		log.Fatal(err)
-	}
+    db, err := initDB()
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
 
-	bot.Debug = true
-	log.Printf("Authorized on account %s", bot.Self.UserName)
-	BOT_USERNAME = bot.Self.UserName
+    bot, err := tgbotapi.NewBotAPI(os.Getenv("BOT_TOKEN"))
+    if err != nil {
+        log.Fatal(err)
+    }
 
-	// Initialize database
-	db := initDB()
-	defer db.Close()
+    BOT_USERNAME = "@" + bot.Self.UserName
+    bot.Debug = true
+    log.Printf("Authorized on account %s", bot.Self.UserName)
 
-	// Set up update channel
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
+    u := tgbotapi.NewUpdate(0)
+    u.Timeout = 60
 
-	// Main loop to handle updates
-	for update := range updates {
-		if update.Message == nil && update.CallbackQuery == nil {
-			continue
-		}
+    updates := bot.GetUpdatesChan(u)
 
-		// Extract user info
-		userID := int64(0)
-		username := ""
-		firstName := ""
-		if update.Message != nil {
-			userID = update.Message.From.ID
-			username = update.Message.From.UserName
-			if update.Message.From.FirstName != "" {
-				firstName = update.Message.From.FirstName
-			} else {
-				firstName = username
-			}
-		} else if update.CallbackQuery != nil {
-			userID = update.CallbackQuery.From.ID
-			username = update.CallbackQuery.From.UserName
-			if update.CallbackQuery.From.FirstName != "" {
-				firstName = update.CallbackQuery.From.FirstName
-			} else {
-				firstName = username
-			}
-		}
-
-		// Get or create user
-		user, err := getUser(db, userID)
-		if err != nil {
-			log.Println("Failed to get user:", err)
-			continue
-		}
-		user.Username = username
-		updateUser(db, user)
-
-		// Handle commands
-		if update.Message != nil && update.Message.IsCommand() {
-			handleCommands(bot, db, update.Message, user)
-		}
-
-		// Handle callback queries
-		if update.CallbackQuery != nil {
-			handleCallbackQueries(bot, db, update.CallbackQuery, user, firstName)
-		}
-
-		// Handle state messages
-		if update.Message != nil && user.State != "" {
-			handleStateMessages(bot, db, update.Message, user, firstName)
-		}
-	}
+    for update := range updates {
+        go handleUpdate(bot, db, update)
+    }
 }
 
-func handleCommands(bot *tgbotapi.BotAPI, db *sql.DB, message *tgbotapi.Message, user User) {
-	userID := message.From.ID
-	switch message.Command() {
-	case "start":
-		// Handle referral
-		referredBy := int64(0)
-		args := message.CommandArguments()
-		if args != "" {
-			referredBy, _ = strconv.ParseInt(args, 10, 64)
-			if referredBy != 0 && referredBy != userID {
-				reward, _ := strconv.ParseFloat(getSetting(db, "referral_reward"))
-				referrer, _ := getUser(db, referredBy)
-				referrer.Balance += reward
-				referrer.Referrals++
-				updateUser(db, referrer)
-			}
-		}
-		user.ReferredBy = referredBy
-		updateUser(db, user)
+func handleUpdate(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update) {
+    if update.Message != nil {
+        user, err := getUser(db, update.Message.From.ID)
+        if err != nil {
+            log.Printf("Error getting user: %v", err)
+            return
+        }
 
-		// Send welcome message
-		startMsg, _ := getSetting(db, "start_message")
-		msg := tgbotapi.NewMessage(userID, escapeMarkdownV2(startMsg))
-		msg.ParseMode = "MarkdownV2"
-		if user.ButtonStyle == "inline" {
-			keyboard := tgbotapi.NewInlineKeyboardMarkup(
-				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonData("💰 Balance", "balance"),
-					tgbotapi.NewInlineKeyboardButtonData("💳 Set Wallet", "set_wallet"),
-				),
-				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonData("📞 Support", "support"),
-					tgbotapi.NewInlineKeyboardButtonData("👥 Referral", "referral"),
-				),
-				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonData("📊 Stats", "stats"),
-					tgbotapi.NewInlineKeyboardButtonData("💸 Withdraw", "withdraw"),
-				),
-			)
-			msg.ReplyMarkup = keyboard
-		} else {
-			keyboard := tgbotapi.NewReplyKeyboard(
-				tgbotapi.NewKeyboardButtonRow(
-					tgbotapi.NewKeyboardButton("💰 Balance"),
-					tgbotapi.NewKeyboardButton("💳 Set Wallet"),
-				),
-				tgbotapi.NewKeyboardButtonRow(
-					tgbotapi.NewKeyboardButton("📞 Support"),
-					tgbotapi.NewKeyboardButton("👥 Referral"),
-				),
-				tgbotapi.NewKeyboardButtonRow(
-					tgbotapi.NewKeyboardButton("📊 Stats"),
-					tgbotapi.NewKeyboardButton("💸 Withdraw"),
-				),
-			)
-			msg.ReplyMarkup = keyboard
-		}
-		bot.Send(msg)
+        if user.ID == 0 {
+            user.ID = update.Message.From.ID
+            user.Username = update.Message.From.UserName
+            if update.Message.Text == "/start" {
+                user.State = "start"
+            } else if strings.HasPrefix(update.Message.Text, "/start ") {
+                refIDStr := strings.TrimPrefix(update.Message.Text, "/start ")
+                refID, _ := strconv.ParseInt(refIDStr, 10, 64)
+                user.ReferrerID = sql.NullInt64{Int64: refID, Valid: refID != 0}
+                user.State = "start"
+            }
+            if err := updateUser(db, user); err != nil {
+                log.Printf("Error updating user: %v", err)
+                return
+            }
+        }
 
-	case "admin":
-		if userID != ADMIN_ID {
-			msg := tgbotapi.NewMessage(userID, "🚫 *Unauthorized.*")
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			return
-		}
-		keyboard := tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("📢 Broadcast", "broadcast"),
-				tgbotapi.NewInlineKeyboardButtonData("📊 User Info", "user_info"),
-			),
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("💵 Set Min Withdrawal", "set_min_withdrawal"),
-				tgbotapi.NewInlineKeyboardButtonData("📡 Set Payment Channel", "set_payment_channel"),
-			),
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("🎁 Set Referral Reward", "set_referral_reward"),
-				tgbotapi.NewInlineKeyboardButtonData("➕ Add Channel", "add_channel"),
-			),
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("➖ Remove Channel", "remove_channel"),
-				tgbotapi.NewInlineKeyboardButtonData("✍️ Start Settings", "start_settings"),
-			),
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("📷 QR Settings", "qr_settings"),
-			),
-		)
-		msg := tgbotapi.NewMessage(userID, "📊 *Admin Panel*")
-		msg.ParseMode = "MarkdownV2"
-		msg.ReplyMarkup = keyboard
-		bot.Send(msg)
-	}
+        switch user.State {
+        case "start":
+            handleStart(bot, db, update, user)
+        case "withdrawal_address":
+            handleWithdrawalAddress(bot, db, update, user)
+        default:
+            switch update.Message.Text {
+            case "/start":
+                handleStart(bot, db, update, user)
+            case "/balance":
+                bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Your balance: %.2f", user.Balance)))
+            case "/referral":
+                handleReferral(bot, db, update, user)
+            case "/withdraw":
+                handleWithdraw(bot, db, update, user)
+            case "/admin":
+                handleAdmin(bot, db, update, user)
+            default:
+                bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Unknown command. Use /start, /balance, /referral, /withdraw, or /admin (for admins)."))
+            }
+        }
+    } else if update.CallbackQuery != nil {
+        handleCallbackQuery(bot, db, update.CallbackQuery)
+    }
 }
 
-func handleCallbackQueries(bot *tgbotapi.BotAPI, db *sql.DB, callback *tgbotapi.CallbackQuery, user User, firstName string) {
-	userID := callback.From.ID
-	data := callback.Data
+func handleStart(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update, user User) {
+    user.State = ""
+    if err := updateUser(db, user); err != nil {
+        log.Printf("Error updating user: %v", err)
+        return
+    }
 
-	switch data {
-	case "balance":
-		msg := tgbotapi.NewMessage(userID, fmt.Sprintf("💰 *Your Balance:* %s\n👥 *Referrals:* %d", escapeMarkdownV2(fmt.Sprintf("%.1f", user.Balance)), user.Referrals))
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "set_wallet":
-		user.State = "setting_wallet"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "💳 *Enter your wallet address:*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "support":
-		user.State = "support_message"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "📞 *Enter your message for support:*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "referral":
-		referralLink := fmt.Sprintf("https://t.me/%s?start=%d", BOT_USERNAME, userID)
-		rows, _ := db.Query("SELECT username FROM users WHERE referred_by = ?", userID)
-		referrals := []string{}
-		for rows.Next() {
-			var refUsername string
-			rows.Scan(&refUsername)
-			referrals = append(referrals, refUsername)
-		}
-		rows.Close()
-		msgText := fmt.Sprintf("👥 *Referral Link:* [%s](%s)\n*Total Referrals:* %d", escapeMarkdownV2(referralLink), referralLink, len(referrals))
-		if len(referrals) > 0 {
-			msgText += "\n*Referred Users:*\n" + strings.Join(referrals, "\n")
-		}
-		msg := tgbotapi.NewMessage(userID, msgText)
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "stats":
-		totalUsers, _ := getTotalUsers(db)
-		completedWithdrawals, _ := getCompletedWithdrawals(db)
-		msg := tgbotapi.NewMessage(userID, fmt.Sprintf("📊 *Stats*\n*Total Users:* %d\n*Completed Withdrawals:* %d", totalUsers, completedWithdrawals))
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "withdraw":
-		minWithdrawal, _ := strconv.ParseFloat(getSetting(db, "min_withdrawal"))
-		if user.Balance < minWithdrawal {
-			msg := tgbotapi.NewMessage(userID, fmt.Sprintf("💸 *Minimum withdrawal is* %s *FREE COIN.*", escapeMarkdownV2(fmt.Sprintf("%.1f", minWithdrawal))))
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			return
-		}
-		if user.Wallet == "" {
-			msg := tgbotapi.NewMessage(userID, "💳 *Please set your wallet address first.*")
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			return
-		}
-		user.State = "withdraw_amount"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "💸 *Enter amount to withdraw:*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "broadcast":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		user.State = "broadcast_message"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "📢 *Enter message to broadcast (text/photo/video/document):*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "user_info":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		user.State = "getting_user_info"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "📊 *Enter user ID or @username:*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "set_min_withdrawal":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		user.State = "setting_min_withdrawal"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "💵 *Enter minimum withdrawal amount:*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "set_payment_channel":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		user.State = "setting_payment_channel"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "📡 *Enter payment channel (@username):*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "set_referral_reward":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		user.State = "setting_referral_reward"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "🎁 *Enter referral reward amount:*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "add_channel":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		user.State = "add_channel"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "➕ *Enter channel to add (@username):*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "remove_channel":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		user.State = "remove_channel"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "➖ *Enter channel to remove (@username):*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "start_settings":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		user.State = "setting_start_message"
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, "✍️ *Enter new start message:*")
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-
-	case "qr_settings":
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		qrEnabled, _ := getSetting(db, "qr_enabled")
-		newValue := "0"
-		if qrEnabled == "0" {
-			newValue = "1"
-		}
-		setSetting(db, "qr_enabled", newValue)
-		msg := tgbotapi.NewMessage(userID, fmt.Sprintf("📷 *QR Code generation is now* %s", escapeMarkdownV2(newValue)))
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-	}
-
-	// Admin actions (ban, unban, adjust balance, etc.)
-	if strings.HasPrefix(data, "adjust_") || strings.HasPrefix(data, "ban_") || strings.HasPrefix(data, "unban_") || strings.HasPrefix(data, "viewrefs_") || strings.HasPrefix(data, "contact_") {
-		if userID != ADMIN_ID {
-			bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized"))
-			return
-		}
-		parts := strings.Split(data, "_")
-		if len(parts) < 2 {
-			return
-		}
-		action, target := parts[0], parts[1]
-		targetID, _ := strconv.ParseInt(target, 10, 64)
-
-		switch action {
-		case "adjust":
-			user.State = fmt.Sprintf("adjusting_balance_%d", targetID)
-			updateUser(db, user)
-			msg := tgbotapi.NewMessage(userID, fmt.Sprintf("💰 *Enter amount to adjust for user* %d *(e.g., +10 or -5):*", targetID))
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-
-		case "ban":
-			targetUser, _ := getUser(db, targetID)
-			targetUser.Banned = true
-			updateUser(db, targetUser)
-			bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("✅ *User* %d *banned.*", targetID)))
-			bot.Send(tgbotapi.NewMessage(targetID, "🚫 *You have been banned from the bot.*"))
-
-		case "unban":
-			targetUser, _ := getUser(db, targetID)
-			targetUser.Banned = false
-			updateUser(db, targetUser)
-			bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("✅ *User* %d *unbanned.*", targetID)))
-			bot.Send(tgbotapi.NewMessage(targetID, "✅ *You have been unbanned!*"))
-
-		case "viewrefs":
-			rows, _ := db.Query("SELECT username FROM users WHERE referred_by = ?", targetID)
-			referrals := []string{}
-			for rows.Next() {
-				var refUsername string
-				rows.Scan(&refUsername)
-				referrals = append(referrals, refUsername)
-			}
-			rows.Close()
-			if len(referrals) > 0 {
-				var bio bytes.Buffer
-				bio.WriteString(strings.Join(referrals, "\n"))
-				file := tgbotapi.FileBytes{Name: fmt.Sprintf("referrals_%d.txt", targetID), Bytes: bio.Bytes()}
-				bot.Send(tgbotapi.NewDocumentUpload(userID, file))
-			} else {
-				msg := tgbotapi.NewMessage(userID, "📄 *No referrals yet.*")
-				msg.ParseMode = "MarkdownV2"
-				bot.Send(msg)
-			}
-
-		case "contact":
-			user.State = fmt.Sprintf("contacting_%d", targetID)
-			updateUser(db, user)
-			msg := tgbotapi.NewMessage(userID, fmt.Sprintf("📩 *Enter message for user* %d:", targetID))
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-		}
-		bot.AnswerCallbackQuery(tgbotapi.NewCallback(callback.ID, ""))
-	}
+    msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Welcome to the Bot!\nUse /balance to check your balance.\nUse /referral to get your referral link.\nUse /withdraw to withdraw your earnings.")
+    if user.ReferrerID.Valid {
+        referrer, err := getUser(db, user.ReferrerID.Int64)
+        if err != nil {
+            log.Printf("Error getting referrer: %v", err)
+            return
+        }
+        if referrer.ID != 0 {
+            reward, err := getSetting(db, "referral_reward")
+            if err != nil {
+                log.Printf("Error getting referral_reward: %v", err)
+                return
+            }
+            rewardFloat, err := strconv.ParseFloat(reward, 64)
+            if err != nil {
+                log.Printf("Error parsing referral_reward: %v", err)
+                return
+            }
+            referrer.Balance += rewardFloat
+            if err := updateUser(db, referrer); err != nil {
+                log.Printf("Error updating referrer: %v", err)
+                return
+            }
+            bot.Send(tgbotapi.NewMessage(referrer.ID, fmt.Sprintf("You earned %.2f for referring a new user!", rewardFloat)))
+        }
+    }
+    bot.Send(msg)
 }
 
-func handleStateMessages(bot *tgbotapi.BotAPI, db *sql.DB, message *tgbotapi.Message, user User, firstName string) {
-	userID := message.From.ID
-	username := message.From.UserName
+func handleReferral(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update, user User) {
+    referralLink := fmt.Sprintf("https://t.me/%s?start=%d", BOT_USERNAME, user.ID)
+    msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Your referral link: %s", referralLink))
+    bot.Send(msg)
+}
 
-	switch user.State {
-	case "setting_wallet":
-		wallet := message.Text
-		user.Wallet = wallet
-		user.State = ""
-		updateUser(db, user)
-		msg := tgbotapi.NewMessage(userID, fmt.Sprintf("💳 *Wallet set to:* `%s`", escapeMarkdownV2(wallet)))
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
+func handleWithdraw(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update, user User) {
+    if user.WithdrawalAddress == "" {
+        user.State = "withdrawal_address"
+        if err := updateUser(db, user); err != nil {
+            log.Printf("Error updating user: %v", err)
+            return
+        }
+        bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Please enter your withdrawal address:"))
+        return
+    }
 
-	case "withdraw_amount":
-		amount, err := strconv.ParseFloat(message.Text, 64)
-		if err != nil || amount <= 0 || amount > user.Balance {
-			msg := tgbotapi.NewMessage(userID, "❌ *Enter a valid amount.*")
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			return
-		}
-		user.Balance -= amount
-		user.State = ""
-		updateUser(db, user)
-		createWithdrawal(db, userID, amount, user.Wallet)
-		bot.Send(tgbotapi.NewMessage(userID, "✅ *Withdrawal request sent! Admin will review soon.*"))
+    if update.Message.Text == "/withdraw" {
+        msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Please enter the amount to withdraw (e.g., /withdraw 7.0):")
+        bot.Send(msg)
+        return
+    }
 
-		paymentChannel, _ := getSetting(db, "payment_channel")
-		if paymentChannel != "" {
-			escapedUsername := escapeMarkdownV2(username)
-			escapedWallet := escapeMarkdownV2(user.Wallet)
-			amountStr := escapeMarkdownV2(fmt.Sprintf("%.1f", amount))
-			rand.Seed(time.Now().UnixNano())
-			txID := fmt.Sprintf("2025%d", rand.Intn(9000000)+1000000)
-			var channelID string
-			err := db.QueryRow("SELECT channel_id FROM required_channels LIMIT 1").Scan(&channelID)
-			if err != nil {
-				channelID = "@DefaultChannel"
-			}
+    amountStr := strings.TrimPrefix(update.Message.Text, "/withdraw ")
+    amount, err := strconv.ParseFloat(amountStr, 64)
+    if err != nil {
+        bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Invalid amount. Please use /withdraw <amount> (e.g., /withdraw 7.0)"))
+        return
+    }
 
-			msgText := fmt.Sprintf(
-				"🔥 *NEW WITHDRAWAL SENT* 🔥\n\n"+
-					"👤 *USER:* [%s](tg://user?id=%d)\n"+
-					"💎 *USER ID:* `%d`\n"+
-					"💰 *AMOUNT:* `%s` FREE COIN\n"+
-					"📞 *REFERRER:* `%d`\n"+
-					"🔗 *ADDRESS:* `%s`\n"+
-					"⏰ *TRANSACTION ID:* `%s`",
-				escapeMarkdownV2(firstName), userID, userID, amountStr, user.Referrals, escapedWallet, txID,
-			)
+    minWithdrawal, err := getSetting(db, "min_withdrawal")
+    if err != nil {
+        log.Printf("Error getting min_withdrawal: %v", err)
+        bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Error: Could not fetch minimum withdrawal limit"))
+        return
+    }
+    minWithdrawalFloat, err := strconv.ParseFloat(minWithdrawal, 64)
+    if err != nil {
+        log.Printf("Error parsing min_withdrawal: %v", err)
+        bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Error: Invalid minimum withdrawal limit"))
+        return
+    }
+    if amount < minWithdrawalFloat {
+        bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Minimum withdrawal is %v", minWithdrawalFloat)))
+        return
+    }
 
-			keyboard := tgbotapi.NewInlineKeyboardMarkup(
-				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonURL("🔍CHANN", fmt.Sprintf("https://t.me/%s", strings.TrimPrefix(channelID, "@"))),
-					tgbotapi.NewInlineKeyboardButtonURL("JOIN", fmt.Sprintf("https://t.me/%s", BOT_USERNAME)),
-				),
-			)
+    if user.Balance < amount {
+        bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Insufficient balance"))
+        return
+    }
 
-			if qrEnabled, _ := getSetting(db, "qr_enabled"); qrEnabled == "1" {
-				qr, err := createQRCode(user.Wallet)
-				if err == nil {
-					photo := tgbotapi.NewPhotoUpload(paymentChannel, tgbotapi.FileBytes{Name: "qrcode.png", Bytes: qr})
-					photo.Caption = msgText
-					photo.ParseMode = "MarkdownV2"
-					photo.ReplyMarkup = keyboard
-					bot.Send(photo)
-				} else {
-					msg := tgbotapi.NewMessageToChannel(paymentChannel, msgText+"\n⚠️ *QR code generation failed.*")
-					msg.ParseMode = "MarkdownV2"
-					msg.ReplyMarkup = keyboard
-					bot.Send(msg)
-				}
-			} else {
-				msg := tgbotapi.NewMessageToChannel(paymentChannel, msgText)
-				msg.ParseMode = "MarkdownV2"
-				msg.ReplyMarkup = keyboard
-				bot.Send(msg)
-			}
-		}
+    user.Balance -= amount
+    if err := updateUser(db, user); err != nil {
+        log.Printf("Error updating user: %v", err)
+        return
+    }
 
-	case "support_message":
-		keyboard := tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("Ban User", fmt.Sprintf("ban_%d", userID)),
-			),
-		)
-		msgText := fmt.Sprintf("📞 *Support from* @%s\n%s", escapeMarkdownV2(username), escapeMarkdownV2(message.Text))
-		msg := tgbotapi.NewMessage(int64(ADMIN_ID), msgText)
-		msg.ParseMode = "MarkdownV2"
-		msg.ReplyMarkup = keyboard
-		bot.Send(msg)
-		user.State = ""
-		updateUser(db, user)
-		bot.Send(tgbotapi.NewMessage(userID, "✅ *Your message has been sent to support!*"))
+    if err := createWithdrawal(db, user.ID, amount, user.WithdrawalAddress); err != nil {
+        log.Printf("Error creating withdrawal: %v", err)
+        return
+    }
 
-	case "broadcast_message":
-		if userID != ADMIN_ID {
-			return
-		}
-		rows, _ := db.Query("SELECT id FROM users WHERE banned = 0")
-		userIDs := []int64{}
-		for rows.Next() {
-			var uid int64
-			rows.Scan(&uid)
-			userIDs = append(userIDs, uid)
-		}
-		rows.Close()
+    msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Withdrawal request of %.2f to %s submitted!", amount, user.WithdrawalAddress))
+    msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonURL("CHANN", "https://t.me/+qB1lX2vD8pY5N2M1"),
+            tgbotapi.NewInlineKeyboardButtonURL("JOIN", "https://t.me/+qB1lX2vD8pY5N2M1"),
+        ),
+    )
+    bot.Send(msg)
+}
 
-		totalUsers := len(userIDs)
-		sentCount := 0
-		statusMsg := tgbotapi.NewMessage(userID, "📢 *Broadcasting:* [□□□□□□□□□□] 0%")
-		statusMsg.ParseMode = "MarkdownV2"
-		sentMsg, _ := bot.Send(statusMsg)
+func handleWithdrawalAddress(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update, user User) {
+    user.WithdrawalAddress = update.Message.Text
+    user.State = ""
+    if err := updateUser(db, user); err != nil {
+        log.Printf("Error updating user: %v", err)
+        return
+    }
+    bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Withdrawal address saved! Use /withdraw to request a withdrawal."))
+}
 
-		for i, uid := range userIDs {
-			var content tgbotapi.Chattable
-			switch {
-			case message.Text != "":
-				msg := tgbotapi.NewMessage(uid, escapeMarkdownV2(message.Text))
-				msg.ParseMode = "MarkdownV2"
-				content = msg
-			case message.Photo != nil:
-				photo := tgbotapi.NewPhotoUpload(uid, message.Photo[len(message.Photo)-1].FileID)
-				photo.Caption = escapeMarkdownV2(message.Caption)
-				photo.ParseMode = "MarkdownV2"
-				content = photo
-			case message.Video != nil:
-				video := tgbotapi.NewVideoUpload(uid, message.Video.FileID)
-				video.Caption = escapeMarkdownV2(message.Caption)
-				video.ParseMode = "MarkdownV2"
-				content = video
-			case message.Document != nil:
-				doc := tgbotapi.NewDocumentUpload(uid, message.Document.FileID)
-				doc.Caption = escapeMarkdownV2(message.Caption)
-				doc.ParseMode = "MarkdownV2"
-				content = doc
-			}
-			if _, err := bot.Send(content); err == nil {
-				sentCount++
-			}
-			progress := (sentCount * 10) / totalUsers
-			bar := strings.Repeat("█", progress) + strings.Repeat("□", 10-progress)
-			percentage := (sentCount * 100) / totalUsers
-			bot.Send(tgbotapi.NewEditMessageText(userID, sentMsg.MessageID, fmt.Sprintf("📢 *Broadcasting:* [%s] %d%% (%d/%d)", bar, percentage, sentCount, totalUsers)))
-			time.Sleep(100 * time.Millisecond)
-		}
-		bot.Send(tgbotapi.NewEditMessageText(userID, sentMsg.MessageID, fmt.Sprintf("✅ *Broadcast completed!* Sent to %d/%d users.", sentCount, totalUsers)))
-		user.State = ""
-		updateUser(db, user)
+func handleAdmin(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update, user User) {
+    if user.ID != ADMIN_ID {
+        bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "🚫 Unauthorized"))
+        return
+    }
 
-	case "getting_user_info":
-		if userID != ADMIN_ID {
-			return
-		}
-		target := message.Text
-		var targetUser User
-		if strings.HasPrefix(target, "@") {
-			targetUser, err = getUserByUsername(db, strings.TrimPrefix(target, "@"))
-		} else {
-			targetID, _ := strconv.ParseInt(target, 10, 64)
-			targetUser, err = getUser(db, targetID)
-		}
-		if err != nil {
-			msg := tgbotapi.NewMessage(userID, "❌ *User not found.*")
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			user.State = ""
-			updateUser(db, user)
-			return
-		}
-		escapedWallet := escapeMarkdownV2(targetUser.Wallet)
-		if targetUser.Wallet == "" {
-			escapedWallet = "Not set"
-		}
-		msgText := fmt.Sprintf(
-			"👤 *User Info*\n*ID:* %d\n*Username:* @%s\n*Balance:* %s 💰\n*Wallet:* `%s`\n*Referrals:* %d\n*Banned:* %v",
-			targetUser.ID, escapeMarkdownV2(targetUser.Username), escapeMarkdownV2(fmt.Sprintf("%.1f", targetUser.Balance)), escapedWallet, targetUser.Referrals, targetUser.Banned,
-		)
-		keyboard := tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("💰 Adjust Balance", fmt.Sprintf("adjust_%d", targetUser.ID)),
-				tgbotapi.NewInlineKeyboardButtonData("Ban User", fmt.Sprintf("ban_%d", targetUser.ID)),
-			),
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("View Referrals", fmt.Sprintf("viewrefs_%d", targetUser.ID)),
-				tgbotapi.NewInlineKeyboardButtonData("Contact User", fmt.Sprintf("contact_%d", targetUser.ID)),
-			),
-		)
-		msg := tgbotapi.NewMessage(userID, msgText)
-		msg.ParseMode = "MarkdownV2"
-		msg.ReplyMarkup = keyboard
-		bot.Send(msg)
-		user.State = ""
-		updateUser(db, user)
+    withdrawals, err := getPendingWithdrawals(db)
+    if err != nil {
+        log.Printf("Error getting withdrawals: %v", err)
+        return
+    }
 
-	case "setting_min_withdrawal", "setting_referral_reward", "setting_start_message", "setting_payment_channel":
-		if userID != ADMIN_ID {
-			return
-		}
-		key := strings.TrimPrefix(user.State, "setting_")
-		value := message.Text
-		setSetting(db, key, value)
-		msg := tgbotapi.NewMessage(userID, fmt.Sprintf("✅ *%s set to:* %s", escapeMarkdownV2(strings.ReplaceAll(key, "_", " ")), escapeMarkdownV2(value)))
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-		user.State = ""
-		updateUser(db, user)
+    if len(withdrawals) == 0 {
+        bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "No pending withdrawals"))
+        return
+    }
 
-	case "add_channel":
-		if userID != ADMIN_ID {
-			return
-		}
-		channel := message.Text
-		if !strings.HasPrefix(channel, "@") {
-			msg := tgbotapi.NewMessage(userID, "❌ *Use '@' (e.g., @ChannelName).*")
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			return
-		}
-		addRequiredChannel(db, channel)
-		msg := tgbotapi.NewMessage(userID, fmt.Sprintf("➕ *Channel* %s *added!*", escapeMarkdownV2(channel)))
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-		user.State = ""
-		updateUser(db, user)
+    for _, w := range withdrawals {
+        user, err := getUser(db, w.UserID)
+        if err != nil {
+            log.Printf("Error getting user: %v", err)
+            continue
+        }
+        msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf(
+            "Withdrawal ID: %d\nUser: @%s\nAmount: %.2f\nAddress: %s\nCreated: %s",
+            w.ID, user.Username, w.Amount, w.Address, w.CreatedAt.Format(time.RFC822),
+        ))
+        msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+            tgbotapi.NewInlineKeyboardRow(
+                tgbotapi.NewInlineKeyboardButtonData("Approve", fmt.Sprintf("approve_%d", w.ID)),
+                tgbotapi.NewInlineKeyboardButtonData("Reject", fmt.Sprintf("reject_%d", w.ID)),
+            ),
+        )
+        bot.Send(msg)
+    }
+}
 
-	case "remove_channel":
-		if userID != ADMIN_ID {
-			return
-		}
-		channel := message.Text
-		if !strings.HasPrefix(channel, "@") {
-			msg := tgbotapi.NewMessage(userID, "❌ *Use '@' (e.g., @ChannelName).*")
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			return
-		}
-		removeRequiredChannel(db, channel)
-		msg := tgbotapi.NewMessage(userID, fmt.Sprintf("➖ *Channel* %s *removed!*", escapeMarkdownV2(channel)))
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-		user.State = ""
-		updateUser(db, user)
+func handleCallbackQuery(bot *tgbotapi.BotAPI, db *sql.DB, callback *tgbotapi.CallbackQuery) {
+    user, err := getUser(db, callback.From.ID)
+    if err != nil {
+        log.Printf("Error getting user: %v", err)
+        return
+    }
 
-	case strings.HasPrefix(user.State, "adjusting_balance_"):
-		if userID != ADMIN_ID {
-			return
-		}
-		parts := strings.Split(user.State, "_")
-		targetUserID, _ := strconv.ParseInt(parts[2], 10, 64)
-		amount, err := strconv.ParseFloat(message.Text, 64)
-		if err != nil {
-			msg := tgbotapi.NewMessage(userID, "❌ *Enter a valid number (e.g., +10 or -5).*")
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			return
-		}
-		targetUser, _ := getUser(db, targetUserID)
-		newBalance := targetUser.Balance + amount
-		if newBalance < 0 {
-			msg := tgbotapi.NewMessage(userID, "❌ *Balance cannot be negative.*")
-			msg.ParseMode = "MarkdownV2"
-			bot.Send(msg)
-			return
-		}
-		targetUser.Balance = newBalance
-		updateUser(db, targetUser)
-		bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("✅ *Balance updated to* %s *for user* %d.", escapeMarkdownV2(fmt.Sprintf("%.1f", newBalance)), targetUserID)))
-		bot.Send(tgbotapi.NewMessage(targetUserID, fmt.Sprintf("💰 *Your balance updated to* %s.", escapeMarkdownV2(fmt.Sprintf("%.1f", newBalance)))))
-		user.State = ""
-		updateUser(db, user)
+    if user.ID != ADMIN_ID {
+        callbackConfig := tgbotapi.NewCallback(callback.ID, "🚫 Unauthorized")
+        _, err := bot.Request(callbackConfig)
+        if err != nil {
+            log.Printf("Error answering callback: %v", err)
+        }
+        return
+    }
 
-	case strings.HasPrefix(user.State, "contacting_"):
-		if userID != ADMIN_ID {
-			return
-		}
-		parts := strings.Split(user.State, "_")
-		targetUserID, _ := strconv.ParseInt(parts[1], 10, 64)
-		msgText := fmt.Sprintf("📩 *Message from Admin:*\n%s", escapeMarkdownV2(message.Text))
-		msg := tgbotapi.NewMessage(targetUserID, msgText)
-		msg.ParseMode = "MarkdownV2"
-		bot.Send(msg)
-		bot.Send(tgbotapi.NewMessage(userID, "✅ *Message sent to user!*"))
-		user.State = ""
-		updateUser(db, user)
-	}
+    data := callback.Data
+    if strings.HasPrefix(data, "approve_") {
+        withdrawalIDStr := strings.TrimPrefix(data, "approve_")
+        withdrawalID, err := strconv.ParseInt(withdrawalIDStr, 10, 64)
+        if err != nil {
+            log.Printf("Error parsing withdrawal ID: %v", err)
+            return
+        }
+
+        if err := updateWithdrawalStatus(db, withdrawalID, "approved"); err != nil {
+            log.Printf("Error updating withdrawal: %v", err)
+            return
+        }
+
+        withdrawal, err := getWithdrawal(db, withdrawalID)
+        if err != nil {
+            log.Printf("Error getting withdrawal: %v", err)
+            return
+        }
+
+        user, err := getUser(db, withdrawal.UserID)
+        if err != nil {
+            log.Printf("Error getting user: %v", err)
+            return
+        }
+
+        callbackConfig := tgbotapi.NewCallback(callback.ID, "✅ Approved")
+        _, err = bot.Request(callbackConfig)
+        if err != nil {
+            log.Printf("Error answering callback: %v", err)
+        }
+        bot.Send(tgbotapi.NewMessage(user.ID, fmt.Sprintf("Your withdrawal of %.2f to %s has been approved!", withdrawal.Amount, withdrawal.Address)))
+    } else if strings.HasPrefix(data, "reject_") {
+        withdrawalIDStr := strings.TrimPrefix(data, "reject_")
+        withdrawalID, err := strconv.ParseInt(withdrawalIDStr, 10, 64)
+        if err != nil {
+            log.Printf("Error parsing withdrawal ID: %v", err)
+            return
+        }
+
+        withdrawal, err := getWithdrawal(db, withdrawalID)
+        if err != nil {
+            log.Printf("Error getting withdrawal: %v", err)
+            return
+        }
+
+        user, err := getUser(db, withdrawal.UserID)
+        if err != nil {
+            log.Printf("Error getting user: %v", err)
+            return
+        }
+
+        user.Balance += withdrawal.Amount
+        if err := updateUser(db, user); err != nil {
+            log.Printf("Error updating user: %v", err)
+            return
+        }
+
+        if err := updateWithdrawalStatus(db, withdrawalID, "rejected"); err != nil {
+            log.Printf("Error updating withdrawal: %v", err)
+            return
+        }
+
+        callbackConfig := tgbotapi.NewCallback(callback.ID, "❌ Rejected")
+        _, err = bot.Request(callbackConfig)
+        if err != nil {
+            log.Printf("Error answering callback: %v", err)
+        }
+        bot.Send(tgbotapi.NewMessage(user.ID, fmt.Sprintf("Your withdrawal of %.2f to %s has been rejected.", withdrawal.Amount, withdrawal.Address)))
+    } else if strings.HasPrefix(data, "qrcode_") {
+        withdrawalIDStr := strings.TrimPrefix(data, "qrcode_")
+        withdrawalID, err := strconv.ParseInt(withdrawalIDStr, 10, 64)
+        if err != nil {
+            log.Printf("Error parsing withdrawal ID: %v", err)
+            return
+        }
+
+        withdrawal, err := getWithdrawal(db, withdrawalID)
+        if err != nil {
+            log.Printf("Error getting withdrawal: %v", err)
+            return
+        }
+
+        qr, err := qrcode.New(withdrawal.Address, qrcode.Medium)
+        if err != nil {
+            log.Printf("Error generating QR code: %v", err)
+            return
+        }
+
+        var buf bytes.Buffer
+        if err := qr.Write(256, &buf); err != nil {
+            log.Printf("Error writing QR code: %v", err)
+            return
+        }
+
+        photo := tgbotapi.NewPhoto(callback.Message.Chat.ID, tgbotapi.FileBytes{
+            Name:  "qrcode.png",
+            Bytes: buf.Bytes(),
+        })
+        photo.Caption = fmt.Sprintf("QR Code for withdrawal address: %s", withdrawal.Address)
+        bot.Send(photo)
+
+        callbackConfig := tgbotapi.NewCallback(callback.ID, "📷 QR Code Generated")
+        _, err = bot.Request(callbackConfig)
+        if err != nil {
+            log.Printf("Error answering callback: %v", err)
+        }
+    }
 }
 
 
+func getWithdrawal(db *sql.DB, withdrawalID int64) (Withdrawal, error) {
+    var w Withdrawal
+    err := db.QueryRow("SELECT id, user_id, amount, address, status, created_at FROM withdrawals WHERE id = ?", withdrawalID).Scan(
+        &w.ID, &w.UserID, &w.Amount, &w.Address, &w.Status, &w.CreatedAt,
+    )
+    return w, err
+}
