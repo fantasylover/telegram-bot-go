@@ -1,15 +1,15 @@
 // Part 1 Starting
 // Part 1 Starting
+// Part 1 Starting
 package main
 
 import (
     "bytes"
     "database/sql"
-    "encoding/json" // Added for unmarshaling bot.Request response
+    "encoding/json" // Needed for unmarshaling bot.MakeRequest response
     "fmt"
     "log"
     "math/rand"
-    "net/url" // Added for url.Values in bot.Request
     "os"
     "strconv"
     "strings"
