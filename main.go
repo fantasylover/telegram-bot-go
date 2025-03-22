@@ -513,6 +513,7 @@ func showAdminPanel(bot *tgbotapi.BotAPI, db *sql.DB, userID int64) {
 // --- Start of Part 8: Handle Update and Menu Options ---
 // --- Start of Part 8: Handle Update and Menu Options ---
 // --- Start of Part 8: Handle Update and Menu Options ---
+// --- Start of Part 8: Handle Update and Menu Options ---
 func handleUpdate(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update) {
     if update.Message != nil {
         userID := update.Message.From.ID
@@ -610,23 +611,17 @@ func handleMenuOptions(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update,
         return
     }
 
-    backButton := tgbotapi.NewInlineKeyboardMarkup(
-        tgbotapi.NewInlineKeyboardRow(
-            tgbotapi.NewInlineKeyboardButtonData("⬅️ Back to Menu", "back_to_menu"),
-        ),
-    )
-
     switch strings.TrimSpace(update.Message.Text) {
     case "💰 Balance":
-        user, err := getUser(db, userID) // Re-fetch to ensure fresh data
+        user, err := getUser(db, userID)
         if err != nil {
             log.Printf("Error re-fetching user %d for balance check: %v", userID, err)
             return
         }
         msg := tgbotapi.NewMessage(userID, formatMarkdownV2("💰 *Balance:* %.2f\n🤝 *Referrals:* %d", user.Balance, user.Referrals))
         msg.ParseMode = "MarkdownV2"
-        msg.ReplyMarkup = backButton
         bot.Send(msg)
+        showMainMenu(bot, userID, user.ButtonStyle)
     case "💳 Set Wallet":
         if user.Wallet != "" {
             msg := tgbotapi.NewMessage(userID, formatMarkdownV2("💳 *Your wallet:* `%s`", user.Wallet))
@@ -641,7 +636,6 @@ func handleMenuOptions(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update,
         } else {
             msg := tgbotapi.NewMessage(userID, "💳 *Enter your wallet address:*")
             msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
             bot.Send(msg)
             user.State = "setting_wallet"
             updateUser(db, user)
@@ -649,7 +643,6 @@ func handleMenuOptions(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update,
     case "📞 Support":
         msg := tgbotapi.NewMessage(userID, "📞 *Send your message for support:*")
         msg.ParseMode = "MarkdownV2"
-        msg.ReplyMarkup = backButton
         bot.Send(msg)
         user.State = "support_message"
         updateUser(db, user)
@@ -672,26 +665,25 @@ func handleMenuOptions(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update,
         totalWithdrawals, _ := getTotalWithdrawals(db)
         msg := tgbotapi.NewMessage(userID, formatMarkdownV2("📈 *Stats:*\n📊 *Total Users:* %d\n💸 *Total Withdrawals:* %d", totalUsers, totalWithdrawals))
         msg.ParseMode = "MarkdownV2"
-        msg.ReplyMarkup = backButton
         bot.Send(msg)
+        showMainMenu(bot, userID, user.ButtonStyle)
     case "💸 Withdraw":
         if user.Wallet == "" {
             msg := tgbotapi.NewMessage(userID, "💳 *Set your wallet first!*")
             msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
             bot.Send(msg)
+            showMainMenu(bot, userID, user.ButtonStyle)
         } else {
             minWithdrawalStr, _ := getSetting(db, "min_withdrawal")
             minWithdrawal, _ := strconv.ParseFloat(minWithdrawalStr, 64)
             if user.Balance < minWithdrawal {
                 msg := tgbotapi.NewMessage(userID, formatMarkdownV2("💸 *Minimum withdrawal:* %.2f", minWithdrawal))
                 msg.ParseMode = "MarkdownV2"
-                msg.ReplyMarkup = backButton
                 bot.Send(msg)
+                showMainMenu(bot, userID, user.ButtonStyle)
             } else {
                 msg := tgbotapi.NewMessage(userID, "💸 *Enter amount to withdraw:*")
                 msg.ParseMode = "MarkdownV2"
-                msg.ReplyMarkup = backButton
                 bot.Send(msg)
                 user.State = "withdraw_amount"
                 updateUser(db, user)
@@ -700,6 +692,7 @@ func handleMenuOptions(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Update,
     }
 }
 // --- End of Part 8: Handle Update and Menu Options ---
+
 
 
 // --- Start of Part 9: Handle Callback Query ---
@@ -1114,6 +1107,7 @@ func handleAdminUserActions(bot *tgbotapi.BotAPI, db *sql.DB, callback *tgbotapi
 // --- Start of Part 10A: Handle State Messages (User States) and QR Code ---
 // --- Start of Part 10A: Handle State Messages (User States) and QR Code ---
 // --- Start of Part 10A: Handle State Messages (User States) and QR Code ---
+// --- Start of Part 10A: Handle State Messages (User States) and QR Code ---
 func createQRCode(data string) ([]byte, error) {
     qr, err := qrcode.New(data, qrcode.Medium)
     if err != nil {
@@ -1126,54 +1120,60 @@ func handleStateMessages(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Updat
     userID := update.Message.From.ID
     state := user.State
 
-    backButton := tgbotapi.NewInlineKeyboardMarkup(
-        tgbotapi.NewInlineKeyboardRow(
-            tgbotapi.NewInlineKeyboardButtonData("⬅️ Back to Menu", "back_to_menu"),
-        ),
-    )
-
     switch state {
     case "setting_wallet":
         wallet := strings.TrimSpace(update.Message.Text)
-        if len(wallet) < 5 {
-            msg := tgbotapi.NewMessage(userID, formatMarkdownV2("❌ *Wallet address too short! Minimum 5 characters\\!*"))
+        // Prevent menu options from being set as wallet
+        if strings.HasPrefix(wallet, "💰") || strings.HasPrefix(wallet, "💳") || strings.HasPrefix(wallet, "📞") ||
+           strings.HasPrefix(wallet, "🔗") || strings.HasPrefix(wallet, "📈") || strings.HasPrefix(wallet, "💸") {
+            msg := tgbotapi.NewMessage(userID, formatMarkdownV2("❌ *Please enter a valid wallet address, not a menu option!*"))
             msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
             bot.Send(msg)
             return
         }
-        // Re-fetch user to ensure all fields are current
+        if len(wallet) < 5 {
+            sendError(bot, userID, ErrWalletTooShort)
+            return
+        }
         user, err := getUser(db, userID)
         if err != nil {
             log.Printf("Error re-fetching user %d for wallet update: %v", userID, err)
-            msg := tgbotapi.NewMessage(userID, formatMarkdownV2("❌ *Error setting wallet\\!*"))
-            msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
-            bot.Send(msg)
+            sendError(bot, userID, ErrUserNotFound)
             return
         }
         user.Wallet = wallet
         user.State = ""
         if err := updateUser(db, user); err != nil {
             log.Printf("Error updating wallet for user %d: %v", userID, err)
-            msg := tgbotapi.NewMessage(userID, formatMarkdownV2("❌ *Error saving wallet\\!*"))
-            msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
-            bot.Send(msg)
+            sendError(bot, userID, ErrWalletUpdateFailed)
             return
         }
         log.Printf("Wallet set to %s for user %d", wallet, userID)
         msg := tgbotapi.NewMessage(userID, formatMarkdownV2("💳 *Wallet set to:* `%s`", wallet))
         msg.ParseMode = "MarkdownV2"
-        msg.ReplyMarkup = backButton
         bot.Send(msg)
+        showMainMenu(bot, userID, user.ButtonStyle) // Return to menu without back button
+
     case "support_message":
-        supportMsg := update.Message.Text
+        supportMsg := strings.TrimSpace(update.Message.Text)
+        if supportMsg == "" {
+            sendError(bot, userID, ErrEmptyMessage)
+            return
+        }
+        user, err := getUser(db, userID) // Re-fetch user to ensure data is fresh
+        if err != nil {
+            log.Printf("Error re-fetching user %d for support: %v", userID, err)
+            sendError(bot, userID, ErrUserNotFound)
+            return
+        }
         user.State = ""
-        updateUser(db, user)
-        msg := tgbotapi.NewMessage(userID, formatMarkdownV2("✅ *Message sent to support\\!*"))
+        if err := updateUser(db, user); err != nil {
+            log.Printf("Error clearing state for user %d after support: %v", userID, err)
+            sendError(bot, userID, ErrStateNotCleared)
+            return
+        }
+        msg := tgbotapi.NewMessage(userID, formatMarkdownV2("✅ *Message sent to support!*"))
         msg.ParseMode = "MarkdownV2"
-        msg.ReplyMarkup = backButton
         bot.Send(msg)
         adminMsg := tgbotapi.NewMessage(ADMIN_ID, formatMarkdownV2("📩 *Support message from* @%s \\(ID: %d\\):\n%s", user.Username, userID, supportMsg))
         adminMsg.ParseMode = "MarkdownV2"
@@ -1182,15 +1182,19 @@ func handleStateMessages(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Updat
                 tgbotapi.NewInlineKeyboardButtonData("Ban User", fmt.Sprintf("ban_%d", userID)),
             ),
         )
-        bot.Send(adminMsg)
+        if _, err := bot.Send(adminMsg); err != nil {
+            log.Printf("Error sending support message to admin from user %d: %v", userID, err)
+            sendError(bot, userID, ErrSendMessageFailed)
+        } else {
+            log.Printf("Support message from user %d sent to admin", userID)
+        }
+        showMainMenu(bot, userID, user.ButtonStyle) // Return to menu without back button
+
     case "withdraw_amount":
         amountStr := strings.TrimSpace(update.Message.Text)
         amount, err := strconv.ParseFloat(amountStr, 64)
         if err != nil || amount <= 0 {
-            msg := tgbotapi.NewMessage(userID, formatMarkdownV2("❌ *Invalid amount\\!*"))
-            msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
-            bot.Send(msg)
+            sendError(bot, userID, ErrInvalidAmount)
             return
         }
         minWithdrawalStr, _ := getSetting(db, "min_withdrawal")
@@ -1201,32 +1205,35 @@ func handleStateMessages(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Updat
         if amount < minWithdrawal {
             msg := tgbotapi.NewMessage(userID, formatMarkdownV2("💸 *Minimum withdrawal:* %.2f", minWithdrawal))
             msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
             bot.Send(msg)
             return
         }
+        user, err := getUser(db, userID) // Re-fetch user
+        if err != nil {
+            log.Printf("Error re-fetching user %d for withdrawal: %v", userID, err)
+            sendError(bot, userID, ErrUserNotFound)
+            return
+        }
         if user.Balance < amount {
-            msg := tgbotapi.NewMessage(userID, formatMarkdownV2("❌ *Insufficient balance\\!*"))
-            msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
-            bot.Send(msg)
+            sendError(bot, userID, ErrInsufficientBalance)
             return
         }
         user.Balance -= amount
         user.State = ""
-        updateUser(db, user)
-        if err := createWithdrawal(db, userID, amount, user.Wallet); err != nil {
-            log.Printf("Error creating withdrawal for user %d: %v", userID, err)
-            msg := tgbotapi.NewMessage(userID, formatMarkdownV2("❌ *Error processing withdrawal\\!*"))
-            msg.ParseMode = "MarkdownV2"
-            msg.ReplyMarkup = backButton
-            bot.Send(msg)
+        if err := updateUser(db, user); err != nil {
+            log.Printf("Error updating user %d balance: %v", userID, err)
+            sendError(bot, userID, ErrAdjustBalanceFailed)
             return
         }
-        msg := tgbotapi.NewMessage(userID, formatMarkdownV2("✅ *Withdrawal request sent! Admin will review soon\\!*"))
+        if err := createWithdrawal(db, userID, amount, user.Wallet); err != nil {
+            log.Printf("Error creating withdrawal for user %d: %v", userID, err)
+            sendError(bot, userID, "E999") // Generic error
+            return
+        }
+        msg := tgbotapi.NewMessage(userID, formatMarkdownV2("✅ *Withdrawal request sent! Admin will review soon!*"))
         msg.ParseMode = "MarkdownV2"
-        msg.ReplyMarkup = backButton
         bot.Send(msg)
+        showMainMenu(bot, userID, user.ButtonStyle) // Return to menu without back button
 
         paymentChannel, _ := getSetting(db, "payment_channel")
         if paymentChannel == "" {
@@ -1235,8 +1242,8 @@ func handleStateMessages(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Updat
         paymentChatID, err := getChatIDFromUsername(bot, paymentChannel)
         if err != nil {
             log.Printf("Error resolving payment channel %s: %v", paymentChannel, err)
-            paymentChatID = ADMIN_ID // Fallback to admin if channel resolution fails
-            bot.Send(tgbotapi.NewMessage(ADMIN_ID, formatMarkdownV2("⚠️ *Failed to resolve payment channel %s for withdrawal notification\\!*", paymentChannel)))
+            paymentChatID = ADMIN_ID
+            bot.Send(tgbotapi.NewMessage(ADMIN_ID, formatMarkdownV2("⚠️ *Failed to resolve payment channel %s!*", paymentChannel)))
         }
 
         firstName := user.Username
@@ -1270,11 +1277,11 @@ func handleStateMessages(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Updat
             qrBytes, err := createQRCode(user.Wallet)
             if err != nil {
                 log.Printf("Error generating QR code for user %d: %v", userID, err)
-                msg := tgbotapi.NewMessage(paymentChatID, notification+"\n⚠️ *QR code generation failed\\!*")
+                msg := tgbotapi.NewMessage(paymentChatID, notification+"\n⚠️ *QR code generation failed!*")
                 msg.ParseMode = "MarkdownV2"
                 msg.ReplyMarkup = markup
                 bot.Send(msg)
-                bot.Send(tgbotapi.NewMessage(ADMIN_ID, formatMarkdownV2("⚠️ *QR code generation failed for withdrawal from user %d\\!*", userID)))
+                bot.Send(tgbotapi.NewMessage(ADMIN_ID, formatMarkdownV2("⚠️ *QR code generation failed for user %d!*", userID)))
             } else {
                 photo := tgbotapi.NewPhoto(paymentChatID, tgbotapi.FileBytes{Name: "qr_withdrawal.png", Bytes: qrBytes})
                 photo.Caption = notification
@@ -1288,11 +1295,13 @@ func handleStateMessages(bot *tgbotapi.BotAPI, db *sql.DB, update tgbotapi.Updat
             msg.ReplyMarkup = markup
             bot.Send(msg)
         }
+
     default:
-        handleAdminStateMessages(bot, db, update, user) // Delegate admin states to Part 10B
+        handleAdminStateMessages(bot, db, update, user)
     }
 }
 // --- End of Part 10A: Handle State Messages (User States) and QR Code ---
+
 
 
 // --- Start of Part 10B: Handle State Messages (Admin States) and Admin Actions ---
